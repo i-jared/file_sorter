@@ -1,19 +1,19 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -141,67 +141,10 @@ func shouldSkipPath(path, inputDir string, skipPaths []string) bool {
 }
 
 func deduplicateFiles(config Config) error {
-	// Map to track seen file hashes
+	// Map to track seen file hashes (only for files we process from input)
 	seenHashes := &sync.Map{}
-	var mu sync.Mutex
 	var totalFiles, uniqueFiles, skippedFiles, alreadyExisted int64
 	var processedFiles int64
-
-	// First, scan the output directory to build hash map of existing files (in parallel)
-	fmt.Println("Scanning output directory for existing files...")
-	var existingCount int64
-	var existingProcessed int64
-	if _, err := os.Stat(config.OutputDir); err == nil {
-		existingJobs := make(chan string, 1000)
-		var existingWg sync.WaitGroup
-
-		// Progress ticker for existing files
-		stopProgress := make(chan bool)
-		go func() {
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					fmt.Fprintf(os.Stderr, "\rScanning existing files: %d processed", atomic.LoadInt64(&existingProcessed))
-				case <-stopProgress:
-					return
-				}
-			}
-		}()
-
-		// Start workers for scanning existing files
-		for i := 0; i < config.NumWorkers; i++ {
-			existingWg.Add(1)
-			go func() {
-				defer existingWg.Done()
-				for path := range existingJobs {
-					if hash, err := hashFile(path); err == nil {
-						seenHashes.Store(hash, path)
-						mu.Lock()
-						existingCount++
-						mu.Unlock()
-					}
-					atomic.AddInt64(&existingProcessed, 1)
-				}
-			}()
-		}
-
-		// Walk and queue existing files
-		filepath.Walk(config.OutputDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
-			}
-			existingJobs <- path
-			return nil
-		})
-
-		close(existingJobs)
-		existingWg.Wait()
-		stopProgress <- true
-	}
-	fmt.Fprintf(os.Stderr, "\rScanning existing files: %d processed\n", existingProcessed)
-	fmt.Printf("Found %d existing files in output directory\n", existingCount)
 
 	// Create job channel and worker pool
 	jobs := make(chan FileJob, 1000)
@@ -231,28 +174,79 @@ func deduplicateFiles(config Config) error {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if shouldProcess(job.Path, config) {
-					hash, err := hashFile(job.Path)
+				if !shouldProcess(job.Path, config) {
+					atomic.AddInt64(&skippedFiles, 1)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+
+				// Calculate destination path
+				relPath, err := filepath.Rel(config.InputDir, job.Path)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nError calculating relative path for %s: %v\n", job.Path, err)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+				dstPath := filepath.Join(config.OutputDir, relPath)
+
+				// Create parent directories
+				dstDir := filepath.Dir(dstPath)
+				if err := os.MkdirAll(dstDir, 0755); err != nil {
+					fmt.Fprintf(os.Stderr, "\nError creating directory %s: %v\n", dstDir, err)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+
+				var hash string
+
+				// Check if destination file already exists
+				if _, err := os.Stat(dstPath); err == nil {
+					// File exists - hash both to check if identical
+					srcHash, err := hashFile(job.Path)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "\nError hashing %s: %v\n", job.Path, err)
+						fmt.Fprintf(os.Stderr, "\nError hashing source %s: %v\n", job.Path, err)
 						atomic.AddInt64(&processedFiles, 1)
 						continue
 					}
 
-					// Check if we've seen this hash before (including existing files)
-					if _, exists := seenHashes.LoadOrStore(hash, job.Path); !exists {
-						// First time seeing this file content
-						if err := copyFilePreservePath(job.Path, config.InputDir, config.OutputDir, job.Info); err != nil {
-							fmt.Fprintf(os.Stderr, "\nError copying %s: %v\n", job.Path, err)
-						} else {
-							atomic.AddInt64(&uniqueFiles, 1)
-						}
-					} else {
-						atomic.AddInt64(&alreadyExisted, 1)
+					dstHash, err := hashFile(dstPath)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "\nError hashing destination %s: %v\n", dstPath, err)
+						atomic.AddInt64(&processedFiles, 1)
+						continue
 					}
-				} else {
-					atomic.AddInt64(&skippedFiles, 1)
+
+					if srcHash == dstHash {
+						// Exact duplicate already exists at destination
+						atomic.AddInt64(&alreadyExisted, 1)
+						atomic.AddInt64(&processedFiles, 1)
+						continue
+					}
+
+					// Different files at same path - skip (keep existing)
+					atomic.AddInt64(&alreadyExisted, 1)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
 				}
+
+				// Destination doesn't exist - copy while hashing in one pass
+				hash, err = hashAndCopyFile(job.Path, dstPath, job.Info)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nError copying %s: %v\n", job.Path, err)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+
+				// Check if we've seen this hash before
+				if _, exists := seenHashes.LoadOrStore(hash, job.Path); exists {
+					// Duplicate content - delete the file we just copied
+					os.Remove(dstPath)
+					atomic.AddInt64(&alreadyExisted, 1)
+				} else {
+					// Unique file - keep it
+					atomic.AddInt64(&uniqueFiles, 1)
+				}
+
 				atomic.AddInt64(&processedFiles, 1)
 			}
 		}()
@@ -342,6 +336,8 @@ func shouldProcess(path string, config Config) bool {
 	return true
 }
 
+const bufferSize = 1024 * 1024 // 1MB buffer for I/O operations
+
 func hashFile(path string) (string, error) {
 	// Check if file still exists before opening
 	if _, err := os.Lstat(path); err != nil {
@@ -354,101 +350,51 @@ func hashFile(path string) (string, error) {
 	}
 	defer file.Close()
 
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
+	hash := xxhash.New()
+	buf := make([]byte, bufferSize)
+	if _, err := io.CopyBuffer(hash, file, buf); err != nil {
 		return "", err
 	}
 
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return strconv.FormatUint(hash.Sum64(), 16), nil
 }
 
-func copyFile(srcPath, dstDir string, info os.FileInfo) error {
+// hashAndCopyFile reads a file once, hashing while copying to destination
+// Returns the hash and any error encountered
+func hashAndCopyFile(srcPath, dstPath string, info os.FileInfo) (string, error) {
 	// Check if source file still exists
 	if _, err := os.Lstat(srcPath); err != nil {
-		return err
-	}
-
-	// Generate unique filename if collision occurs
-	baseName := filepath.Base(srcPath)
-	dstPath := filepath.Join(dstDir, baseName)
-
-	// Handle filename collisions by appending a number
-	counter := 1
-	for {
-		if _, err := os.Stat(dstPath); os.IsNotExist(err) {
-			break
-		}
-		ext := filepath.Ext(baseName)
-		nameWithoutExt := strings.TrimSuffix(baseName, ext)
-		dstPath = filepath.Join(dstDir, fmt.Sprintf("%s_%d%s", nameWithoutExt, counter, ext))
-		counter++
+		return "", err
 	}
 
 	src, err := os.Open(srcPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer src.Close()
 
 	dst, err := os.Create(dstPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, src); err != nil {
-		return err
+	// Hash while copying in a single pass
+	hash := xxhash.New()
+	buf := make([]byte, bufferSize)
+
+	// TeeReader writes to hash while we copy to dst
+	teeReader := io.TeeReader(src, hash)
+	if _, err := io.CopyBuffer(dst, teeReader, buf); err != nil {
+		return "", err
 	}
 
 	// Preserve file permissions
-	return os.Chmod(dstPath, info.Mode())
-}
-
-func copyFilePreservePath(srcPath, inputDir, outputDir string, info os.FileInfo) error {
-	// Check if source file still exists
-	if _, err := os.Lstat(srcPath); err != nil {
-		return err
+	if err := os.Chmod(dstPath, info.Mode()); err != nil {
+		return "", err
 	}
 
-	// Calculate relative path from input directory
-	relPath, err := filepath.Rel(inputDir, srcPath)
-	if err != nil {
-		return err
-	}
-
-	// Construct destination path preserving directory structure
-	dstPath := filepath.Join(outputDir, relPath)
-
-	// Create all parent directories
-	dstDir := filepath.Dir(dstPath)
-	if err := os.MkdirAll(dstDir, 0755); err != nil {
-		return err
-	}
-
-	// Check if destination file already exists
-	if _, err := os.Stat(dstPath); err == nil {
-		// File exists, skip it (already handled by hash checking)
-		return nil
-	}
-
-	src, err := os.Open(srcPath)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	dst, err := os.Create(dstPath)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	if _, err := io.Copy(dst, src); err != nil {
-		return err
-	}
-
-	// Preserve file permissions
-	return os.Chmod(dstPath, info.Mode())
+	return strconv.FormatUint(hash.Sum64(), 16), nil
 }
 
 func listExtensions(inputDir string, numWorkers int, skipPaths []string) error {
