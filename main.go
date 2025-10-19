@@ -22,6 +22,7 @@ type Config struct {
 	OutputDir  string
 	Whitelist  []string
 	Blacklist  []string
+	SkipPaths  []string
 	NumWorkers int
 }
 
@@ -36,6 +37,7 @@ func main() {
 		extCmd := flag.NewFlagSet("extensions", flag.ExitOnError)
 		inputDir := extCmd.String("input", "", "Input directory path (required)")
 		workers := extCmd.Int("workers", 8, "Number of concurrent workers")
+		skipPaths := extCmd.String("skip", "", "Comma-separated relative paths to skip (e.g., .git,node_modules,temp)")
 		extCmd.Parse(os.Args[2:])
 
 		if *inputDir == "" {
@@ -44,7 +46,8 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := listExtensions(*inputDir, *workers); err != nil {
+		skipList := parseSkipPaths(*skipPaths)
+		if err := listExtensions(*inputDir, *workers, skipList); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -56,6 +59,7 @@ func main() {
 	outputDir := flag.String("output", "", "Output directory path (required)")
 	whitelist := flag.String("whitelist", "", "Comma-separated file extensions to include (e.g., jpg,png,pdf)")
 	blacklist := flag.String("blacklist", "", "Comma-separated file extensions to exclude (e.g., tmp,log)")
+	skipPaths := flag.String("skip", "", "Comma-separated relative paths to skip (e.g., .git,node_modules,temp)")
 	workers := flag.Int("workers", 8, "Number of concurrent workers")
 	flag.Parse()
 
@@ -77,6 +81,7 @@ func main() {
 		OutputDir:  *outputDir,
 		Whitelist:  parseExtensions(*whitelist),
 		Blacklist:  parseExtensions(*blacklist),
+		SkipPaths:  parseSkipPaths(*skipPaths),
 		NumWorkers: *workers,
 	}
 
@@ -101,6 +106,38 @@ func parseExtensions(input string) []string {
 		exts[i] = strings.TrimSpace(strings.TrimPrefix(ext, "."))
 	}
 	return exts
+}
+
+func parseSkipPaths(input string) []string {
+	if input == "" {
+		return nil
+	}
+	paths := strings.Split(input, ",")
+	for i, path := range paths {
+		paths[i] = strings.TrimSpace(path)
+	}
+	return paths
+}
+
+func shouldSkipPath(path, inputDir string, skipPaths []string) bool {
+	if len(skipPaths) == 0 {
+		return false
+	}
+
+	// Get relative path from input directory
+	relPath, err := filepath.Rel(inputDir, path)
+	if err != nil {
+		return false
+	}
+
+	// Check if this path or any parent path should be skipped
+	for _, skip := range skipPaths {
+		// Check if the relative path starts with the skip path
+		if relPath == skip || strings.HasPrefix(relPath, skip+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func deduplicateFiles(config Config) error {
@@ -240,10 +277,17 @@ func deduplicateFiles(config Config) error {
 					err = nil
 				} else {
 					// Still can't access it, skip this entry
-					fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", path, err)
 					return nil
 				}
 			}
+		}
+
+		// Check if this path should be skipped
+		if shouldSkipPath(path, config.InputDir, config.SkipPaths) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
 		if !info.IsDir() {
@@ -407,7 +451,7 @@ func copyFilePreservePath(srcPath, inputDir, outputDir string, info os.FileInfo)
 	return os.Chmod(dstPath, info.Mode())
 }
 
-func listExtensions(inputDir string, numWorkers int) error {
+func listExtensions(inputDir string, numWorkers int, skipPaths []string) error {
 	extMap := &sync.Map{}
 	jobs := make(chan string, 1000)
 	var wg sync.WaitGroup
@@ -465,6 +509,14 @@ func listExtensions(inputDir string, numWorkers int) error {
 					return nil
 				}
 			}
+		}
+
+		// Check if this path should be skipped
+		if shouldSkipPath(path, inputDir, skipPaths) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
 		if !info.IsDir() {
